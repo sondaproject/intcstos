@@ -1,4 +1,4 @@
-// intcstOS kernel version z1.1 the CALCULATOR update
+// intcstOS kernel version z2-b (beta, check for bugs please.) added RAM filesystem, file manager, notepad, and more simple linux commands
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -7,7 +7,7 @@
 #error "You are not using a cross-compiler, you will most certainly run into trouble"
 #endif
 
-// multiboot definition
+// Multiboot Definition
 typedef struct multiboot_info {
     uint32_t flags;
     uint32_t mem_lower;
@@ -40,13 +40,13 @@ typedef struct multiboot_info {
     uint8_t  color_info[6];
 } __attribute__((packed)) multiboot_info_t;
 
-// framebuffer
+// Framebuffer Setup
 static uint32_t* framebuffer = NULL;
 static uint32_t screen_width = 0;
 static uint32_t screen_height = 0;
 static uint32_t screen_pitch = 0;
 
-// color palette 
+// Color Palette 
 #define color_desktop_bg 0x001b4d3e
 #define color_taskbar    0x002d3748
 #define color_button     0x003182ce
@@ -59,8 +59,10 @@ static uint32_t screen_pitch = 0;
 #define color_dark_gray  0x004a5568
 #define color_light_gray 0x00718096
 #define color_orange     0x00dd6b20
+#define color_yellow     0x00ecc94b
+#define color_teal       0x00319795
 
-// i/o port
+// Port I/O Helpers
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
@@ -115,37 +117,149 @@ void draw_string(const char* str, uint32_t x, uint32_t y, uint32_t fg_color) {
     }
 }
 
-// ui engine state flags
+//ramfs engine. stores files in ram WARNING, reboot will cause yor file to get deleted
+#define MAX_VFS_NODES 64
+#define MAX_FILENAME_LEN 32
+#define MAX_FILE_SIZE 512
+
+typedef struct {
+    char name[MAX_FILENAME_LEN];
+    bool is_dir;
+    bool used;
+    int parent;
+    uint32_t size;
+    char content[MAX_FILE_SIZE];
+} vfs_node_t;
+
+static vfs_node_t vfs_nodes[MAX_VFS_NODES];
+static int current_dir_idx = 0; // Root directory is 0
+
+static bool strcmp_exact(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a != *b) return false;
+        a++; b++;
+    }
+    return (*a == *b);
+}
+
+static void strcpy_safe(char* dest, const char* src, uint32_t max_len) {
+    uint32_t i = 0;
+    while (src[i] != '\0' && i < max_len - 1) {
+        dest[i] = src[i];
+        i++;
+    }
+    dest[i] = '\0';
+}
+
+void vfs_init(void) {
+    for (int i = 0; i < MAX_VFS_NODES; i++) {
+        vfs_nodes[i].used = false;
+        vfs_nodes[i].is_dir = false;
+        vfs_nodes[i].parent = -1;
+        vfs_nodes[i].size = 0;
+        vfs_nodes[i].content[0] = '\0';
+    }
+    // the root dir (/)
+    vfs_nodes[0].used = true;
+    vfs_nodes[0].is_dir = true;
+    vfs_nodes[0].parent = -1;
+    strcpy_safe(vfs_nodes[0].name, "/", MAX_FILENAME_LEN);
+    current_dir_idx = 0;
+}
+
+int vfs_find_child(int parent_idx, const char* name) {
+    for (int i = 0; i < MAX_VFS_NODES; i++) {
+        if (vfs_nodes[i].used && vfs_nodes[i].parent == parent_idx) {
+            if (strcmp_exact(vfs_nodes[i].name, name)) return i;
+        }
+    }
+    return -1;
+}
+
+int vfs_create_node(int parent_idx, const char* name, bool is_dir) {
+    if (vfs_find_child(parent_idx, name) != -1) return -1; // Already exists
+    for (int i = 0; i < MAX_VFS_NODES; i++) {
+        if (!vfs_nodes[i].used) {
+            vfs_nodes[i].used = true;
+            vfs_nodes[i].is_dir = is_dir;
+            vfs_nodes[i].parent = parent_idx;
+            vfs_nodes[i].size = 0;
+            vfs_nodes[i].content[0] = '\0';
+            strcpy_safe(vfs_nodes[i].name, name, MAX_FILENAME_LEN);
+            return i;
+        }
+    }
+    return -1;
+}
+
+void vfs_get_path(int node_idx, char* out_buf) {
+    if (node_idx == 0) {
+        strcpy_safe(out_buf, "/", MAX_FILENAME_LEN);
+        return;
+    }
+    char temp[128] = {0};
+    int current = node_idx;
+    out_buf[0] = '\0';
+
+    while (current > 0) {
+        char seg[MAX_FILENAME_LEN + 2] = "/";
+        uint32_t idx = 1;
+        for (uint32_t i = 0; vfs_nodes[current].name[i] != '\0'; i++) {
+            seg[idx++] = vfs_nodes[current].name[i];
+        }
+        seg[idx] = '\0';
+
+        // Prepend segment
+        char prev_temp[128];
+        strcpy_safe(prev_temp, temp, 128);
+        strcpy_safe(temp, seg, 128);
+        
+        uint32_t temp_len = idx;
+        for (uint32_t j = 0; prev_temp[j] != '\0' && temp_len < 127; j++) {
+            temp[temp_len++] = prev_temp[j];
+        }
+        temp[temp_len] = '\0';
+
+        current = vfs_nodes[current].parent;
+    }
+    strcpy_safe(out_buf, temp, 128);
+}
+
+//application sates, tells the kernel to "draw" the window and whats inside
+enum WindowFocus { FOCUS_NONE, FOCUS_TERM, FOCUS_CALC, FOCUS_NOTEPAD, FOCUS_FM };
+static enum WindowFocus focused_window = FOCUS_TERM;
+
 static bool start_menu_open = false;
 
-// terminal state for example open o boot
 static bool window_open = false;
-static int win_x = 120;
-static int win_y = 80;
-static int win_w = 540;
-static int win_h = 360;
+static int win_x = 100, win_y = 60, win_w = 520, win_h = 350;
 
-// calculator state
 static bool calc_open = false;
-static int calc_x = 220;
-static int calc_y = 100;
-static int calc_w = 210;
-static int calc_h = 270;
-
+static int calc_x = 220, calc_y = 90, calc_w = 210, calc_h = 270;
 static char calc_disp[16] = "0";
 static int calc_disp_len = 1;
 static int32_t calc_operand = 0;
 static char calc_op = 0;
 static bool calc_clear_on_next = false;
 
-// window dragging state
-enum DragTarget { DRAG_NONE, DRAG_TERM, DRAG_CALC };
+static bool notepad_open = false;
+static int np_x = 180, np_y = 80, np_w = 420, np_h = 300;
+static int np_file_idx = -1;
+static char np_filename[MAX_FILENAME_LEN] = "untitled.txt";
+static char np_buffer[MAX_FILE_SIZE] = {0};
+static uint32_t np_buf_len = 0;
+
+static bool fm_open = false;
+static int fm_x = 140, fm_y = 100, fm_w = 440, fm_h = 290;
+static int fm_current_dir = 0;
+
+// window dragging function
+enum DragTarget { DRAG_NONE, DRAG_TERM, DRAG_CALC, DRAG_NOTEPAD, DRAG_FM };
 static enum DragTarget current_drag = DRAG_NONE;
 static int drag_offset_x = 0;
 static int drag_offset_y = 0;
 static bool prev_left_click = false;
 
-// terminal history
 #define TERM_MAX_LINES 12
 #define TERM_LINE_LEN 60
 static char term_lines[TERM_MAX_LINES][TERM_LINE_LEN];
@@ -155,7 +269,7 @@ static uint32_t term_line_count = 0;
 static char term_input[kb_buf_max] = {0};
 static uint32_t term_input_len = 0;
 
-// ps/2 keyboard driver
+//keyboard map
 static const char scancode_ascii[128] = {
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -163,7 +277,7 @@ static const char scancode_ascii[128] = {
     '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
 };
 
-/* Terminal Output Buffer Handler */
+//function to print text on the terminal
 void term_print(const char* msg) {
     if (term_line_count >= TERM_MAX_LINES) {
         for (uint32_t i = 1; i < TERM_MAX_LINES; i++) {
@@ -190,19 +304,29 @@ void term_clear(void) {
     }
 }
 
-static bool strcmp_exact(const char* a, const char* b) {
-    while (*a && *b) {
-        if (*a != *b) return false;
-        a++;
-        b++;
+//notepad functons
+void open_notepad_file(const char* filename) {
+    int node = vfs_find_child(current_dir_idx, filename);
+    if (node == -1) {
+        node = vfs_create_node(current_dir_idx, filename, false);
     }
-    return (*a == *b);
+    
+    if (node != -1 && !vfs_nodes[node].is_dir) {
+        np_file_idx = node;
+        strcpy_safe(np_filename, vfs_nodes[node].name, MAX_FILENAME_LEN);
+        strcpy_safe(np_buffer, vfs_nodes[node].content, MAX_FILE_SIZE);
+        np_buf_len = 0;
+        while (np_buffer[np_buf_len] != '\0') np_buf_len++;
+        notepad_open = true;
+        focused_window = FOCUS_NOTEPAD;
+    } else {
+        term_print("Error: Target is a directory or disk full.");
+    }
 }
 
-// terminal commands
 void execute_command(const char* cmd) {
     char echo_buf[68] = "int> ";
-    uint32_t idx = 19;
+    uint32_t idx = 5;
     uint32_t c_idx = 0;
     while (cmd[c_idx] != '\0' && idx < 67) {
         echo_buf[idx++] = cmd[c_idx++];
@@ -210,166 +334,300 @@ void execute_command(const char* cmd) {
     echo_buf[idx] = '\0';
     term_print(echo_buf);
 
-    if (strcmp_exact(cmd, "help")) {
-        term_print("Available Commands:");
-        term_print("  help    - Show this manual");
-        term_print("  clear   - Clear terminal output");
-        term_print("  about   - intcstOS kernel details");
-        term_print("  fetch   - Display system info ");
-        term_print("  calc    - Launch desktop calculator");
-        term_print("  reboot  - Restart the computer");
-    } else if (strcmp_exact(cmd, "clear")) {
+    // Extract Command Name and First Parameter
+    char name[32] = {0};
+    char arg[32] = {0};
+    uint32_t p = 0, np = 0, ap = 0;
+
+    while (cmd[p] == ' ') p++;
+    while (cmd[p] != ' ' && cmd[p] != '\0' && np < 31) name[np++] = cmd[p++];
+    name[np] = '\0';
+    while (cmd[p] == ' ') p++;
+    while (cmd[p] != '\0' && ap < 31) arg[ap++] = cmd[p++];
+    arg[ap] = '\0';
+
+    if (strcmp_exact(name, "help")) {
+        term_print("System Commands:");
+        term_print("  ls, mkdir, touch, cd, pwd, cat, note");
+        term_print("  calc, fetch, about, clear, reboot");
+    } else if (strcmp_exact(name, "ls")) {
+        term_print("Directory Contents:");
+        for (int i = 0; i < MAX_VFS_NODES; i++) {
+            if (vfs_nodes[i].used && vfs_nodes[i].parent == current_dir_idx) {
+                char item_line[48] = "  ";
+                uint32_t lp = 2;
+                if (vfs_nodes[i].is_dir) {
+                    item_line[lp++] = '['; item_line[lp++] = 'D'; item_line[lp++] = 'I'; item_line[lp++] = 'R'; item_line[lp++] = ']'; item_line[lp++] = ' ';
+                }
+                for (uint32_t k = 0; vfs_nodes[i].name[k] != '\0' && lp < 45; k++) {
+                    item_line[lp++] = vfs_nodes[i].name[k];
+                }
+                item_line[lp] = '\0';
+                term_print(item_line);
+            }
+        }
+    } else if (strcmp_exact(name, "mkdir")) {
+        if (arg[0] == '\0') term_print("Usage: mkdir <dirname>");
+        else if (vfs_create_node(current_dir_idx, arg, true) == -1) term_print("Error creating directory.");
+    } else if (strcmp_exact(name, "touch")) {
+        if (arg[0] == '\0') term_print("Usage: touch <filename>");
+        else if (vfs_create_node(current_dir_idx, arg, false) == -1) term_print("Error creating file.");
+    } else if (strcmp_exact(name, "cd")) {
+        if (arg[0] == '\0' || strcmp_exact(arg, "/")) {
+            current_dir_idx = 0;
+        } else if (strcmp_exact(arg, "..")) {
+            if (vfs_nodes[current_dir_idx].parent != -1) {
+                current_dir_idx = vfs_nodes[current_dir_idx].parent;
+            }
+        } else {
+            int target = vfs_find_child(current_dir_idx, arg);
+            if (target != -1 && vfs_nodes[target].is_dir) {
+                current_dir_idx = target;
+            } else {
+                term_print("Directory not found.");
+            }
+        }
+    } else if (strcmp_exact(name, "pwd")) {
+        char path[128];
+        vfs_get_path(current_dir_idx, path);
+        term_print(path);
+    } else if (strcmp_exact(name, "cat")) {
+        if (arg[0] == '\0') term_print("Usage: cat <filename>");
+        else {
+            int target = vfs_find_child(current_dir_idx, arg);
+            if (target != -1 && !vfs_nodes[target].is_dir) {
+                term_print(vfs_nodes[target].content);
+            } else {
+                term_print("File not found.");
+            }
+        }
+    } else if (strcmp_exact(name, "note")) {
+        if (arg[0] == '\0') open_notepad_file("untitled.txt");
+        else open_notepad_file(arg);
+    } else if (strcmp_exact(name, "clear")) {
         term_clear();
-    } else if (strcmp_exact(cmd, "about")) {
-        term_print("32-bits, Open-source, by SondaProject");
-    } else if (strcmp_exact(cmd, "fetch")) {
+    } else if (strcmp_exact(name, "about")) {
+        term_print("intcstOS z1.2 - 32-bit GUI Kernel by SondaProject");
+    } else if (strcmp_exact(name, "fetch")) {
         term_print(" ___ _   _ _____    ");
-        term_print("|_ _| \ | |_   _|    OS: intcstOS i686-32");
-        term_print(" | ||  \| | | |      Input: PS/2 Dual Mouse/Keyboard Driver");
-        term_print(" | || |\  | | |      Display: VBE Framebuffer Pixel Engine");
-        term_print("|___|_| \_| |_|  ");
-    } else if (strcmp_exact(cmd, "calc")) {
+        term_print("|_ _| \\ | |_   _|   OS: intcstOS i686-32");
+        term_print(" | ||  \\| | | |     Version: z2-b (beta)");
+        term_print(" | || |\\  | | |     Display Engine: VBE");
+        term_print("|___|_| \\_| |_|  ");
+    } else if (strcmp_exact(name, "calc")) {
         calc_open = true;
-        term_print("Launched Calculator Application.");
-    } else if (strcmp_exact(cmd, "reboot")) {
-        outb(0x64, 0xfe);
-    }else if (strcmp_exact(cmd, "67")) {
-        term_print("pak you bradar");
+        focused_window = FOCUS_CALC;
+    } else if (strcmp_exact(name, "reboot")) {
         outb(0x64, 0xfe);
     } else if (cmd[0] != '\0') {
-        term_print("The kernel is afraid of you(unknown command)");
+        term_print("Unknown command. Type 'help'.");
     }
 }
 
+//draws the desktop icons
 void draw_desktop_icons(void) {
-    // terminal Icon
-    uint32_t icon_x = 30;
-    uint32_t icon_y = 40;
+    //terminal
+    uint32_t x = 30, y = 30;
+    draw_rect(x, y, 48, 40, color_black);
+    draw_rect(x + 2, y + 2, 44, 36, color_dark_gray);
+    draw_string(">", x + 8, y + 12, color_green);
+    draw_string("_", x + 20, y + 12, color_white);
+    draw_string("Terminal", x - 8, y + 46, color_white);
 
-    draw_rect(icon_x, icon_y, 48, 40, color_black);
-    draw_rect(icon_x + 2, icon_y + 2, 44, 36, color_dark_gray);
-    draw_string(">", icon_x + 8, icon_y + 12, color_green);
-    draw_string("_", icon_x + 20, icon_y + 12, color_white);
-    draw_string("Terminal", icon_x - 8, icon_y + 48, color_white);
+    //calculator
+    x = 30; y = 105;
+    draw_rect(x, y, 48, 40, color_black);
+    draw_rect(x + 2, y + 2, 44, 36, color_light_gray);
+    draw_string("12", x + 8, y + 6, color_white);
+    draw_string("+=", x + 8, y + 20, color_orange);
+    draw_string("Calc", x + 8, y + 46, color_white);
 
-    // calculator icon
-    uint32_t calc_icon_x = 30;
-    uint32_t calc_icon_y = 120;
+    //file manager
+    x = 30; y = 180;
+    draw_rect(x, y, 48, 40, color_black);
+    draw_rect(x + 2, y + 2, 44, 36, color_yellow);
+    draw_string("DIR", x + 10, y + 12, color_black);
+    draw_string("Files", x + 4, y + 46, color_white);
 
-    draw_rect(calc_icon_x, calc_icon_y, 48, 40, color_black);
-    draw_rect(calc_icon_x + 2, calc_icon_y + 2, 44, 36, color_light_gray);
-    draw_string("12", calc_icon_x + 8, calc_icon_y + 6, color_white);
-    draw_string("+=", calc_icon_x + 8, calc_icon_y + 20, color_orange);
-    draw_string("Calc", calc_icon_x + 8, calc_icon_y + 48, color_white);
+    //notepad
+    x = 30; y = 255;
+    draw_rect(x, y, 48, 40, color_black);
+    draw_rect(x + 2, y + 2, 44, 36, color_white);
+    draw_string("TXT", x + 10, y + 12, color_dark_gray);
+    draw_string("Notepad", x - 4, y + 46, color_white);
 }
 
+//draw the terminal window
 void draw_terminal_window(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (!window_open) return;
 
-    // shell and background
-    draw_rect(x, y, w, h, color_black);               
-    draw_rect(x, y, w, 24, color_window_hdr);        
+    //background
+    draw_rect(x, y, w, h, color_black);
+    draw_rect(x, y, w, 24, (focused_window == FOCUS_TERM) ? color_window_hdr : color_dark_gray);
 
-    // close button
+    //close button for windows
     draw_rect(x + w - 24, y + 2, 20, 20, color_close_btn);
     draw_string("X", x + w - 18, y + 4, color_white);
 
-    // window border
-    for (uint32_t i = 0; i < w; i++) {
-        put_pixel(x + i, y, color_dark_gray);
-        put_pixel(x + i, y + h - 1, color_dark_gray);
-    }
-    for (uint32_t j = 0; j < h; j++) {
-        put_pixel(x, y + j, color_dark_gray);
-        put_pixel(x + w - 1, y + j, color_dark_gray);
-    }
-
-    draw_string("terminal", x + 8, y + 4, color_white);
+    //window title
+    draw_string("Terminal", x + 8, y + 4, color_white);
 
     uint32_t start_y = y + 32;
     for (uint32_t i = 0; i < term_line_count; i++) {
         draw_string(term_lines[i], x + 12, start_y + (i * 20), color_white);
     }
 
-    // shell line before input
+    //terminal shell
     uint32_t prompt_y = start_y + (term_line_count * 20);
     if (prompt_y <= y + h - 28) {
-        draw_string("intshell> ", x + 9, prompt_y, color_white);
-        draw_string(term_input, x + 164, prompt_y, color_green);
-        draw_rect(x + 164 + (term_input_len * 8), prompt_y, 8, 16, color_green);
+        const char* prompt = "voidsh> ";
+        uint32_t prompt_x = x + 12;            // Shifted from x + 9 to align with term_lines
+        uint32_t input_x = prompt_x + (8 * 8);  // 8 chars * 8px = x + 76 (prevents overlap)
+
+        draw_string(prompt, prompt_x, prompt_y, color_white);
+        draw_string(term_input, input_x, prompt_y, color_green);
+
+        if (focused_window == FOCUS_TERM) {
+            draw_rect(input_x + (term_input_len * 8), prompt_y, 8, 16, color_green);
+        }
     }
 }
 
 #include "calc.c"
 
-// start menu button and start menu
+//draws the notepad window
+void draw_notepad_window(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!notepad_open) return;
+
+    draw_rect(x, y, w, h, color_white);
+    draw_rect(x, y, w, 24, (focused_window == FOCUS_NOTEPAD) ? color_teal : color_dark_gray);
+
+    draw_rect(x + w - 24, y + 2, 20, 20, color_close_btn);
+    draw_string("X", x + w - 18, y + 4, color_white);
+
+    char title_buf[48] = "Notepad - ";
+    strcpy_safe(title_buf + 10, np_filename, 32);
+    draw_string(title_buf, x + 8, y + 4, color_white);
+
+    uint32_t cur_x = x + 8;
+    uint32_t cur_y = y + 32;
+    
+    for (uint32_t i = 0; i < np_buf_len; i++) {
+        char c = np_buffer[i];
+        if (c == '\n') {
+            cur_x = x + 8;
+            cur_y += 18;
+        } else {
+            draw_char(c, cur_x, cur_y, color_black);
+            cur_x += 8;
+            if (cur_x >= x + w - 16) {
+                cur_x = x + 8;
+                cur_y += 18;
+            }
+        }
+    }
+
+    //cursor
+    if (focused_window == FOCUS_NOTEPAD) {
+        draw_rect(cur_x, cur_y, 2, 16, color_black);
+    }
+}
+
+//same thing but with the file manager
+void draw_file_manager_window(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!fm_open) return;
+
+    draw_rect(x, y, w, h, color_menu_bg);
+    draw_rect(x, y, w, 24, (focused_window == FOCUS_FM) ? color_button : color_dark_gray);
+
+    draw_rect(x + w - 24, y + 2, 20, 20, color_close_btn);
+    draw_string("X", x + w - 18, y + 4, color_white);
+
+    char path_buf[128] = "Files: ";
+    vfs_get_path(fm_current_dir, path_buf + 7);
+    draw_string(path_buf, x + 8, y + 4, color_white);
+
+    draw_rect(x + 8, y + 30, 48, 22, color_dark_gray);
+    draw_string("[..]", x + 12, y + 34, color_white);
+
+    uint32_t item_y = y + 60;
+    for (int i = 0; i < MAX_VFS_NODES; i++) {
+        if (vfs_nodes[i].used && vfs_nodes[i].parent == fm_current_dir) {
+            if (item_y + 20 >= y + h) break;
+
+            if (vfs_nodes[i].is_dir) {
+                draw_rect(x + 12, item_y, 16, 14, color_yellow);
+                draw_string(vfs_nodes[i].name, x + 36, item_y, color_white);
+            } else {
+                draw_rect(x + 12, item_y, 16, 14, color_light_gray);
+                draw_string(vfs_nodes[i].name, x + 36, item_y, color_white);
+            }
+            item_y += 22;
+        }
+    }
+}
+
+//draws the start menu
 void draw_start_menu(void) {
     if (!start_menu_open) return;
     
     uint32_t menu_x = 10;
-    uint32_t menu_y = screen_height - 240;
+    uint32_t menu_y = screen_height - 270;
     uint32_t menu_w = 160;
-    uint32_t menu_h = 198;
+    uint32_t menu_h = 228;
 
     draw_rect(menu_x, menu_y, menu_w, menu_h, color_menu_bg);
-    
-    for (uint32_t i = 0; i < menu_w; i++) {
-        put_pixel(menu_x + i, menu_y, color_button);
-        put_pixel(menu_x + i, menu_y + menu_h - 1, color_button);
-    }
-    for (uint32_t j = 0; j < menu_h; j++) {
-        put_pixel(menu_x, menu_y + j, color_button);
-        put_pixel(menu_x + menu_w - 1, menu_y + j, color_button);
-    }
+    draw_rect(menu_x, menu_y, menu_w, 2, color_button);
 
     draw_string("> Terminal", menu_x + 12, menu_y + 12, color_white);
     draw_string("> Calculator", menu_x + 12, menu_y + 48, color_white);
-    draw_string("> Clear Screen", menu_x + 12, menu_y + 84, color_white);
-    draw_string("> About OS", menu_x + 12, menu_y + 120, color_white);
-    draw_string("> Reboot System", menu_x + 12, menu_y + 156, color_white);
+    draw_string("> File Manager", menu_x + 12, menu_y + 84, color_white);
+    draw_string("> Notepad", menu_x + 12, menu_y + 120, color_white);
+    draw_string("> Clear Screen", menu_x + 12, menu_y + 156, color_white);
+    draw_string("> Reboot System", menu_x + 12, menu_y + 192, color_white);
 }
 
-// desktop
 void ui_render_desktop(void) {
     draw_rect(0, 0, screen_width, screen_height, color_desktop_bg);
     draw_desktop_icons();
     
     draw_terminal_window(win_x, win_y, win_w, win_h);
     draw_calculator_window(calc_x, calc_y, calc_w, calc_h);
+    draw_notepad_window(np_x, np_y, np_w, np_h);
+    draw_file_manager_window(fm_x, fm_y, fm_w, fm_h);
 
-    // "taskbar"
+    // Taskbar
     draw_rect(0, screen_height - 40, screen_width, 40, color_taskbar);
-
-    // start button
     draw_rect(10, screen_height - 32, 80, 24, color_button);
     draw_string("Start", 28, screen_height - 28, color_white);
 
     draw_start_menu();
 }
 
-// mouse pointer
+//mouse cursor, fully customizable.
 #define cursor_w 12
 #define cursor_h 19
+
 static const char* cursor_sprite[cursor_h] = {
-    "XX            "
-    "X.X           ",
-    "X..X          ",
-    "X...X         ",
-    "X....X        ",
-    "X.....X       ",
-    "X......X      ",
-    "X.......X     ",
-    "X........X    ",
-    "X.........X   ",
-    "X..........X  ",
-    "X.......XXXX  ",
-    "X..X..Xx       ",
-    "X.X X...X      ",
-    "XX   X...X     ",
-    "X     X...X    ",
-    "       X...X   ",
-    "         XX    ",
-    "               "
+    "X           ",
+    "XX          ",
+    "X.X         ",
+    "X..X        ",
+    "X...X       ",
+    "X....X      ",
+    "X.....X     ",
+    "X......X    ",
+    "X.......X   ",
+    "X........X  ",
+    "X.....XXXXX ",
+    "X..X..X     ",
+    "X.X X..X    ",
+    "XX   X..X   ",
+    "     X..X   ",
+    "      X..X  ",
+    "      X..X  ",
+    "       XX   ",
+    "            "
 };
 
 static int mouse_x = 400;
@@ -396,11 +654,8 @@ void mouse_draw_sprite(int x, int y) {
     for (int cy = 0; cy < cursor_h; cy++) {
         for (int cx = 0; cx < cursor_w; cx++) {
             char pixel = cursor_sprite[cy][cx];
-            if (pixel == 'X') {
-                put_pixel(x + cx, y + cy, color_black);
-            } else if (pixel == '.') {
-                put_pixel(x + cx, y + cy, color_white);
-            }
+            if (pixel == 'X') put_pixel(x + cx, y + cy, color_black);
+            else if (pixel == '.') put_pixel(x + cx, y + cy, color_white);
         }
     }
 }
@@ -420,7 +675,6 @@ static void mouse_wait(uint8_t type) {
     }
 }
 
-// mouse input
 static void mouse_write(uint8_t val) {
     mouse_wait(1);
     outb(0x64, 0xd4);
@@ -428,37 +682,21 @@ static void mouse_write(uint8_t val) {
     outb(0x60, val);
 }
 
-// mouse read (input to output)
 static uint8_t mouse_read(void) {
     mouse_wait(0);
     return inb(0x60);
 }
 
-// mouse init
 void ps2_mouse_init(void) {
     uint8_t status;
-
-    mouse_wait(1);
-    outb(0x64, 0xa8); 
-
-    mouse_wait(1);
-    outb(0x64, 0x20);
+    mouse_wait(1); outb(0x64, 0xa8); 
+    mouse_wait(1); outb(0x64, 0x20);
     status = mouse_read();
-
-    status |= 0x02;   
-    status &= ~0x20;  
-
-    mouse_wait(1);
-    outb(0x64, 0x60);
-    mouse_wait(1);
-    outb(0x60, status);
-
-    mouse_write(0xf6); 
-    mouse_read();
-
-    mouse_write(0xf4); 
-    mouse_read();
-
+    status |= 0x02; status &= ~0x20;  
+    mouse_wait(1); outb(0x64, 0x60);
+    mouse_wait(1); outb(0x60, status);
+    mouse_write(0xf6); mouse_read();
+    mouse_write(0xf4); mouse_read();
     while (inb(0x64) & 1) { inb(0x60); io_wait(); } 
 
     mouse_save_backbuffer(mouse_x, mouse_y);
@@ -474,135 +712,114 @@ static bool mouse_read_byte(uint8_t* out_byte) {
     return false;
 }
 
-// mouse events
+//mouse click events, for example when you click on an icon
 void handle_mouse_events(int x, int y, bool left_down) {
     bool click_event = left_down && !prev_left_click;
     bool needs_redraw = false;
 
-    // desktop terminal icon click
-    if (click_event && x >= 20 && x <= 80 && y >= 30 && y <= 100) {
-        window_open = true;
-        needs_redraw = true;
+    if (click_event && x >= 20 && x <= 80) {
+        if (y >= 20 && y <= 80) {
+            window_open = true; focused_window = FOCUS_TERM; needs_redraw = true;
+        } else if (y >= 95 && y <= 155) {
+            calc_open = true; focused_window = FOCUS_CALC; needs_redraw = true;
+        } else if (y >= 170 && y <= 230) {
+            fm_open = true; focused_window = FOCUS_FM; needs_redraw = true;
+        } else if (y >= 245 && y <= 305) {
+            open_notepad_file("untitled.txt"); needs_redraw = true;
+        }
     }
 
-    // desktop calculator icon click
-    else if (click_event && x >= 20 && x <= 80 && y >= 110 && y <= 180) {
-        calc_open = true;
-        needs_redraw = true;
-    }
-
-    // toggle start menu
     else if (click_event && x >= 10 && x <= 90 && y >= (int)screen_height - 32 && y <= (int)screen_height - 8) {
         start_menu_open = !start_menu_open;
         needs_redraw = true;
     }
 
-    // start menu items
     else if (start_menu_open && click_event) {
         uint32_t menu_x = 10;
-        uint32_t menu_y = screen_height - 240;
-        
+        uint32_t menu_y = screen_height - 270;
         if (x >= (int)menu_x && x <= (int)(menu_x + 160)) {
             if (y >= (int)(menu_y + 10) && y <= (int)(menu_y + 40)) {
-                window_open = true;
-                start_menu_open = false;
-                needs_redraw = true;
+                window_open = true; focused_window = FOCUS_TERM;
             } else if (y >= (int)(menu_y + 40) && y <= (int)(menu_y + 70)) {
-                calc_open = true;
-                start_menu_open = false;
-                needs_redraw = true;
+                calc_open = true; focused_window = FOCUS_CALC;
             } else if (y >= (int)(menu_y + 70) && y <= (int)(menu_y + 110)) {
+                fm_open = true; focused_window = FOCUS_FM;
+            } else if (y >= (int)(menu_y + 110) && y <= (int)(menu_y + 140)) {
+                open_notepad_file("untitled.txt");
+            } else if (y >= (int)(menu_y + 140) && y <= (int)(menu_y + 180)) {
                 term_clear();
-                start_menu_open = false;
-                needs_redraw = true;
-            } else if (y >= (int)(menu_y + 110) && y <= (int)(menu_y + 150)) {
-                execute_command("about");
-                window_open = true;
-                start_menu_open = false;
-                needs_redraw = true;
-            } else if (y >= (int)(menu_y + 150) && y <= (int)(menu_y + 190)) {
-                outb(0x64, 0xfe); 
-            } else {
-                start_menu_open = false;
-                needs_redraw = true;
+            } else if (y >= (int)(menu_y + 180) && y <= (int)(menu_y + 220)) {
+                outb(0x64, 0xfe);
             }
-        } else {
-            start_menu_open = false;
+        }
+        start_menu_open = false;
+        needs_redraw = true;
+    }
+
+    else if (window_open && click_event && (x >= win_x + win_w - 24 && x <= win_x + win_w - 4 && y >= win_y + 2 && y <= win_y + 22)) {
+        window_open = false; needs_redraw = true;
+    } else if (calc_open && click_event && (x >= calc_x + calc_w - 24 && x <= calc_x + calc_w - 4 && y >= calc_y + 2 && y <= calc_y + 22)) {
+        calc_open = false; needs_redraw = true;
+    } else if (notepad_open && click_event && (x >= np_x + np_w - 24 && x <= np_x + np_w - 4 && y >= np_y + 2 && y <= np_y + 22)) {
+        notepad_open = false; needs_redraw = true;
+    } else if (fm_open && click_event && (x >= fm_x + fm_w - 24 && x <= fm_x + fm_w - 4 && y >= fm_y + 2 && y <= fm_y + 22)) {
+        fm_open = false; needs_redraw = true;
+    }
+
+    else if (fm_open && click_event && (x >= fm_x + 8 && x <= fm_x + 56 && y >= fm_y + 30 && y <= fm_y + 52)) {
+        if (vfs_nodes[fm_current_dir].parent != -1) {
+            fm_current_dir = vfs_nodes[fm_current_dir].parent;
             needs_redraw = true;
         }
     }
 
-    // close terminal window button
-    else if (window_open && click_event && (x >= win_x + win_w - 24 && x <= win_x + win_w - 4 && y >= win_y + 2 && y <= win_y + 22)) {
-        window_open = false;
-        needs_redraw = true;
-    }
-
-    // close calculator window button
-    else if (calc_open && click_event && (x >= calc_x + calc_w - 24 && x <= calc_x + calc_w - 4 && y >= calc_y + 2 && y <= calc_y + 22)) {
-        calc_open = false;
-        needs_redraw = true;
-    }
-
-    // calculator grid clicks
-    else if (calc_open && click_event && (x >= calc_x + 12 && x <= calc_x + calc_w - 12 && y >= calc_y + 80 && y <= calc_y + calc_h - 10)) {
-        uint32_t start_grid_x = calc_x + 12;
-        uint32_t start_grid_y = calc_y + 80;
-
-        for (int r = 0; r < 4; r++) {
-            for (int c = 0; c < 4; c++) {
-                uint32_t bx = start_grid_x + c * 46;
-                uint32_t by = start_grid_y + r * 42;
-                if (x >= (int)bx && x <= (int)(bx + 40) && y >= (int)by && y <= (int)(by + 36)) {
-                    calc_press_btn(calc_grid[r][c]);
+    else if (fm_open && click_event && (x >= fm_x + 12 && x <= fm_x + fm_w - 12 && y >= fm_y + 60)) {
+        uint32_t item_y = fm_y + 60;
+        for (int i = 0; i < MAX_VFS_NODES; i++) {
+            if (vfs_nodes[i].used && vfs_nodes[i].parent == fm_current_dir) {
+                if (y >= (int)item_y && y <= (int)(item_y + 20)) {
+                    if (vfs_nodes[i].is_dir) {
+                        fm_current_dir = i;
+                    } else {
+                        open_notepad_file(vfs_nodes[i].name);
+                    }
                     needs_redraw = true;
+                    break;
                 }
+                item_y += 22;
             }
         }
     }
 
-    // drag initiation checks
     if (click_event && current_drag == DRAG_NONE) {
-        if (calc_open && x >= calc_x && x <= calc_x + calc_w - 24 && y >= calc_y && y <= calc_y + 24) {
-            current_drag = DRAG_CALC;
-            drag_offset_x = x - calc_x;
-            drag_offset_y = y - calc_y;
-        } else if (window_open && x >= win_x && x <= win_x + win_w - 24 && y >= win_y && y <= win_y + 24) {
-            current_drag = DRAG_TERM;
-            drag_offset_x = x - win_x;
-            drag_offset_y = y - win_y;
+        if (notepad_open && x >= np_x && x <= np_x + np_w && y >= np_y && y <= np_y + np_h) {
+            focused_window = FOCUS_NOTEPAD;
+            if (y <= np_y + 24) { current_drag = DRAG_NOTEPAD; drag_offset_x = x - np_x; drag_offset_y = y - np_y; }
+            needs_redraw = true;
+        } else if (fm_open && x >= fm_x && x <= fm_x + fm_w && y >= fm_y && y <= fm_y + fm_h) {
+            focused_window = FOCUS_FM;
+            if (y <= fm_y + 24) { current_drag = DRAG_FM; drag_offset_x = x - fm_x; drag_offset_y = y - fm_y; }
+            needs_redraw = true;
+        } else if (calc_open && x >= calc_x && x <= calc_x + calc_w && y >= calc_y && y <= calc_y + calc_h) {
+            focused_window = FOCUS_CALC;
+            if (y <= calc_y + 24) { current_drag = DRAG_CALC; drag_offset_x = x - calc_x; drag_offset_y = y - calc_y; }
+            needs_redraw = true;
+        } else if (window_open && x >= win_x && x <= win_x + win_w && y >= win_y && y <= win_y + win_h) {
+            focused_window = FOCUS_TERM;
+            if (y <= win_y + 24) { current_drag = DRAG_TERM; drag_offset_x = x - win_x; drag_offset_y = y - win_y; }
+            needs_redraw = true;
         }
     }
 
-    // drag handling
     if (left_down && current_drag != DRAG_NONE) {
-        if (current_drag == DRAG_TERM) {
-            int new_win_x = x - drag_offset_x;
-            int new_win_y = y - drag_offset_y;
-            if (new_win_x != win_x || new_win_y != win_y) {
-                win_x = new_win_x;
-                win_y = new_win_y;
-                needs_redraw = true;
-            }
-        } else if (current_drag == DRAG_CALC) {
-            int new_calc_x = x - drag_offset_x;
-            int new_calc_y = y - drag_offset_y;
-            if (new_calc_x != calc_x || new_calc_y != calc_y) {
-                calc_x = new_calc_x;
-                calc_y = new_calc_y;
-                needs_redraw = true;
-            }
-        }
+        if (current_drag == DRAG_TERM) { win_x = x - drag_offset_x; win_y = y - drag_offset_y; needs_redraw = true; }
+        else if (current_drag == DRAG_CALC) { calc_x = x - drag_offset_x; calc_y = y - drag_offset_y; needs_redraw = true; }
+        else if (current_drag == DRAG_NOTEPAD) { np_x = x - drag_offset_x; np_y = y - drag_offset_y; needs_redraw = true; }
+        else if (current_drag == DRAG_FM) { fm_x = x - drag_offset_x; fm_y = y - drag_offset_y; needs_redraw = true; }
     }
 
-    if (!left_down) {
-        current_drag = DRAG_NONE;
-    }
-
-    if (needs_redraw) {
-        ui_render_desktop();
-    }
-
+    if (!left_down) current_drag = DRAG_NONE;
+    if (needs_redraw) ui_render_desktop();
     prev_left_click = left_down;
 }
 
@@ -611,32 +828,20 @@ static uint8_t mouse_packet[3];
 
 void mouse_poll_update(void) {
     uint8_t b;
-
     while (mouse_read_byte(&b)) {
         if (mouse_cycle == 0) {
-            if (b & 0x08) {
-                mouse_packet[0] = b;
-                mouse_cycle = 1;
-            }
+            if (b & 0x08) { mouse_packet[0] = b; mouse_cycle = 1; }
         } else if (mouse_cycle == 1) {
-            mouse_packet[1] = b;
-            mouse_cycle = 2;
+            mouse_packet[1] = b; mouse_cycle = 2;
         } else if (mouse_cycle == 2) {
-            mouse_packet[2] = b;
-            mouse_cycle = 0;
+            mouse_packet[2] = b; mouse_cycle = 0;
 
-            uint8_t b1 = mouse_packet[0];
-            uint8_t b2 = mouse_packet[1];
-            uint8_t b3 = mouse_packet[2];
-
-            int rel_x = (int8_t)b2;
-            int rel_y = (int8_t)b3;
-            bool left_click = (b1 & 0x01);
+            int rel_x = (int8_t)mouse_packet[1];
+            int rel_y = (int8_t)mouse_packet[2];
+            bool left_click = (mouse_packet[0] & 0x01);
 
             mouse_restore_backbuffer(mouse_x, mouse_y);
-
-            mouse_x += rel_x;
-            mouse_y -= rel_y; 
+            mouse_x += rel_x; mouse_y -= rel_y; 
 
             if (mouse_x < 0) mouse_x = 0;
             if (mouse_y < 0) mouse_y = 0;
@@ -644,16 +849,15 @@ void mouse_poll_update(void) {
             if (mouse_y >= (int)screen_height - cursor_h) mouse_y = screen_height - cursor_h;
 
             handle_mouse_events(mouse_x, mouse_y, left_click);
-
             mouse_save_backbuffer(mouse_x, mouse_y);
             mouse_draw_sprite(mouse_x, mouse_y);
         }
     }
 }
 
+/* Keyboard Dispatcher Routine */
 void keyboard_poll_update(void) {
     uint8_t status = inb(0x64);
-    
     if ((status & 0x01) && !(status & 0x20)) {
         uint8_t scancode = inb(0x60);
 
@@ -661,27 +865,49 @@ void keyboard_poll_update(void) {
             char key = scancode_ascii[scancode];
             bool char_added = false;
 
-            if (key == '\b') {
-                if (term_input_len > 0) {
-                    term_input_len--;
-                    term_input[term_input_len] = '\0';
-                    char_added = true;
+            // Route Input Based on Focused Application
+            if (focused_window == FOCUS_NOTEPAD && notepad_open) {
+                if (key == '\b') {
+                    if (np_buf_len > 0) {
+                        np_buf_len--;
+                        np_buffer[np_buf_len] = '\0';
+                        char_added = true;
+                    }
+                } else if (key == '\n' || (key >= ' ' && key <= '~')) {
+                    if (np_buf_len < MAX_FILE_SIZE - 1) {
+                        np_buffer[np_buf_len++] = key;
+                        np_buffer[np_buf_len] = '\0';
+                        char_added = true;
+                    }
                 }
-            } else if (key == '\n') {
-                execute_command(term_input);
-                term_input_len = 0;
-                term_input[0] = '\0';
-                char_added = true;
-            } else if (key >= ' ' && key <= '~') {
-                if (term_input_len < kb_buf_max - 1) {
-                    term_input[term_input_len] = key;
-                    term_input_len++;
-                    term_input[term_input_len] = '\0';
+
+                // Save Back to RAMFS Live Node
+                if (np_file_idx != -1 && char_added) {
+                    strcpy_safe(vfs_nodes[np_file_idx].content, np_buffer, MAX_FILE_SIZE);
+                    vfs_nodes[np_file_idx].size = np_buf_len;
+                }
+            } else if (focused_window == FOCUS_TERM && window_open) {
+                if (key == '\b') {
+                    if (term_input_len > 0) {
+                        term_input_len--;
+                        term_input[term_input_len] = '\0';
+                        char_added = true;
+                    }
+                } else if (key == '\n') {
+                    execute_command(term_input);
+                    term_input_len = 0;
+                    term_input[0] = '\0';
                     char_added = true;
+                } else if (key >= ' ' && key <= '~') {
+                    if (term_input_len < kb_buf_max - 1) {
+                        term_input[term_input_len++] = key;
+                        term_input[term_input_len] = '\0';
+                        char_added = true;
+                    }
                 }
             }
 
-            if (window_open && char_added) {
+            if (char_added) {
                 mouse_restore_backbuffer(mouse_x, mouse_y);
                 ui_render_desktop();
                 mouse_save_backbuffer(mouse_x, mouse_y);
@@ -691,20 +917,30 @@ void keyboard_poll_update(void) {
     }
 }
 
+//kernel start
 void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
-    if (magic != 0x2badb002 || !(mb_info->flags & (1 << 12))) {
-        return;
-    }
+    if (magic != 0x2badb002 || !(mb_info->flags & (1 << 12))) return;
 
     framebuffer = (uint32_t*)(uintptr_t)mb_info->framebuffer_addr;
     screen_width = mb_info->framebuffer_width;
     screen_height = mb_info->framebuffer_height;
     screen_pitch = mb_info->framebuffer_pitch;
 
-    // terminal start
+    // Initialize VFS System
+    vfs_init();
+
+    // Default Seed Files
+    vfs_create_node(0, "main", true);
+    int docs_dir = vfs_find_child(0, "main");
+    int note_file = vfs_create_node(docs_dir, "welcome.txt", false);
+    if (note_file != -1) {
+        strcpy_safe(vfs_nodes[note_file].content, "Welcome to INTcstOS", MAX_FILE_SIZE);
+        vfs_nodes[note_file].size = 26;
+    }
+
     term_clear();
-    term_print("Welcome to the terminal");
-    term_print("Type 'help' for available commands.");
+    term_print("intcstOS Kernel z2 Started.");
+    term_print("drivers succesfully initialized. Type 'help' for commands.");
 
     ui_render_desktop();
     ps2_mouse_init();
@@ -714,5 +950,3 @@ void kernel_main(uint32_t magic, multiboot_info_t* mb_info) {
         keyboard_poll_update();
     }
 }
-
-//thats it, to people that says its vibecoded, IT IS NOT! if you dont see grammar errors is because im trying to keep it clean and undertsandable, but if you see some, please let me notice, im italian so its pretty hard for me, thank you all for the support see you soon! <3
